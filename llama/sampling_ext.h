@@ -23,7 +23,6 @@ extern "C"
         int32_t mirostat;
         float mirostat_tau;
         float mirostat_eta;
-        bool penalize_nl;
         uint32_t seed;
         char *grammar;
     };
@@ -35,6 +34,9 @@ extern "C"
     llama_token common_sampler_csample(struct common_sampler *sampler, struct llama_context *ctx, int idx);
 
     int schema_to_grammar(const char *json_schema, char *grammar, size_t max_len);
+
+    struct llama_vocab * llama_load_vocab_from_file(const char * fname);
+    void llama_free_vocab(struct llama_vocab * vocab);
 
 #ifdef __cplusplus
 }

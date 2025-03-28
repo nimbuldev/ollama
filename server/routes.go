@@ -30,16 +30,23 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/discover"
 	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/llm"
-	"github.com/ollama/ollama/model/mllama"
+	"github.com/ollama/ollama/model/models/mllama"
 	"github.com/ollama/ollama/openai"
-	"github.com/ollama/ollama/parser"
-	"github.com/ollama/ollama/runners"
+	"github.com/ollama/ollama/server/internal/client/ollama"
+	"github.com/ollama/ollama/server/internal/registry"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
 )
+
+func experimentEnabled(name string) bool {
+	return slices.Contains(strings.Split(os.Getenv("OLLAMA_EXPERIMENT"), ","), name)
+}
+
+var useClient2 = experimentEnabled("client2")
 
 var mode string = gin.DebugMode
 
@@ -142,7 +149,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
-		case err.Error() == "invalid model name":
+		case err.Error() == errtypes.InvalidModelNameErrMsg:
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -204,7 +211,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	images := make([]llm.ImageData, len(req.Images))
 	for i := range req.Images {
-		if isMllama {
+		if isMllama && len(model.ProjectorPaths) > 0 {
 			data, opts, err := mllama.Preprocess(bytes.NewReader(req.Images[i]))
 			if err != nil {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "error processing image"})
@@ -428,7 +435,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 		return
 	}
 
-	kvData, err := getKVData(m.ModelPath, false)
+	kvData, _, err := getModelData(m.ModelPath, false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -476,8 +483,7 @@ func (s *Server) EmbedHandler(c *gin.Context) {
 	}
 
 	if err := g.Wait(); err != nil {
-		slog.Error("embedding generation failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Errorf("failed to generate embeddings: %v", err)})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": strings.TrimSpace(err.Error())})
 		return
 	}
 
@@ -538,8 +544,7 @@ func (s *Server) EmbeddingsHandler(c *gin.Context) {
 
 	embedding, err := r.Embedding(c.Request.Context(), req.Prompt)
 	if err != nil {
-		slog.Info(fmt.Sprintf("embedding generation failed: %v", err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Errorf("failed to generate embedding: %v", err)})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": strings.TrimSpace(err.Error())})
 		return
 	}
 
@@ -568,7 +573,7 @@ func (s *Server) PullHandler(c *gin.Context) {
 
 	name := model.ParseName(cmp.Or(req.Model, req.Name))
 	if !name.IsValid() {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid model name"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": errtypes.InvalidModelNameErrMsg})
 		return
 	}
 
@@ -688,77 +693,6 @@ func getExistingName(n model.Name) (model.Name, error) {
 	return n, nil
 }
 
-func (s *Server) CreateHandler(c *gin.Context) {
-	var r api.CreateRequest
-	if err := c.ShouldBindJSON(&r); errors.Is(err, io.EOF) {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
-		return
-	} else if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	name := model.ParseName(cmp.Or(r.Model, r.Name))
-	if !name.IsValid() {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": errtypes.InvalidModelNameErrMsg})
-		return
-	}
-
-	name, err := getExistingName(name)
-	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if r.Path == "" && r.Modelfile == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "path or Modelfile are required"})
-		return
-	}
-
-	var sr io.Reader = strings.NewReader(r.Modelfile)
-	if r.Path != "" && r.Modelfile == "" {
-		f, err := os.Open(r.Path)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("error reading modelfile: %s", err)})
-			return
-		}
-		defer f.Close()
-
-		sr = f
-	}
-
-	f, err := parser.ParseFile(sr)
-	if err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	ch := make(chan any)
-	go func() {
-		defer close(ch)
-		fn := func(resp api.ProgressResponse) {
-			ch <- resp
-		}
-
-		ctx, cancel := context.WithCancel(c.Request.Context())
-		defer cancel()
-
-		quantization := cmp.Or(r.Quantize, r.Quantization)
-		if err := CreateModel(ctx, name, filepath.Dir(r.Path), strings.ToUpper(quantization), f, fn); errors.Is(err, errBadTemplate) {
-			ch <- gin.H{"error": err.Error(), "status": http.StatusBadRequest}
-		} else if err != nil {
-			ch <- gin.H{"error": err.Error()}
-		}
-	}()
-
-	if r.Stream != nil && !*r.Stream {
-		waitForStream(c, ch)
-		return
-	}
-
-	streamResponse(c, ch)
-}
-
 func (s *Server) DeleteHandler(c *gin.Context) {
 	var r api.DeleteRequest
 	if err := c.ShouldBindJSON(&r); errors.Is(err, io.EOF) {
@@ -829,7 +763,7 @@ func (s *Server) ShowHandler(c *gin.Context) {
 		switch {
 		case os.IsNotExist(err):
 			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
-		case err.Error() == "invalid model name":
+		case err.Error() == errtypes.InvalidModelNameErrMsg:
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -843,7 +777,7 @@ func (s *Server) ShowHandler(c *gin.Context) {
 func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 	name := model.ParseName(req.Model)
 	if !name.IsValid() {
-		return nil, errModelPathInvalid
+		return nil, ErrModelPathInvalid
 	}
 	name, err := getExistingName(name)
 	if err != nil {
@@ -914,16 +848,23 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 	fmt.Fprint(&sb, m.String())
 	resp.Modelfile = sb.String()
 
-	kvData, err := getKVData(m.ModelPath, req.Verbose)
+	kvData, tensors, err := getModelData(m.ModelPath, req.Verbose)
 	if err != nil {
 		return nil, err
 	}
+
 	delete(kvData, "general.name")
 	delete(kvData, "tokenizer.chat_template")
 	resp.ModelInfo = kvData
 
+	tensorData := make([]api.Tensor, len(tensors.Items()))
+	for cnt, t := range tensors.Items() {
+		tensorData[cnt] = api.Tensor{Name: t.Name, Type: t.Type(), Shape: t.Shape}
+	}
+	resp.Tensors = tensorData
+
 	if len(m.ProjectorPaths) > 0 {
-		projectorData, err := getKVData(m.ProjectorPaths[0], req.Verbose)
+		projectorData, _, err := getModelData(m.ProjectorPaths[0], req.Verbose)
 		if err != nil {
 			return nil, err
 		}
@@ -933,17 +874,17 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 	return resp, nil
 }
 
-func getKVData(digest string, verbose bool) (llm.KV, error) {
+func getModelData(digest string, verbose bool) (ggml.KV, ggml.Tensors, error) {
 	maxArraySize := 0
 	if verbose {
 		maxArraySize = -1
 	}
-	kvData, err := llm.LoadModel(digest, maxArraySize)
+	data, err := llm.LoadModel(digest, maxArraySize)
 	if err != nil {
-		return nil, err
+		return nil, ggml.Tensors{}, err
 	}
 
-	kv := kvData.KV()
+	kv := data.KV()
 
 	if !verbose {
 		for k := range kv {
@@ -953,7 +894,7 @@ func getKVData(digest string, verbose bool) (llm.KV, error) {
 		}
 	}
 
-	return kv, nil
+	return kv, data.Tensors(), nil
 }
 
 func (s *Server) ListHandler(c *gin.Context) {
@@ -1198,56 +1139,86 @@ func allowedHostsMiddleware(addr net.Addr) gin.HandlerFunc {
 	}
 }
 
-func (s *Server) GenerateRoutes() http.Handler {
-	config := cors.DefaultConfig()
-	config.AllowWildcard = true
-	config.AllowBrowserExtensions = true
-	config.AllowHeaders = []string{"Authorization", "Content-Type", "User-Agent", "Accept", "X-Requested-With"}
-	openAIProperties := []string{"lang", "package-version", "os", "arch", "retry-count", "runtime", "runtime-version", "async"}
-	for _, prop := range openAIProperties {
-		config.AllowHeaders = append(config.AllowHeaders, "x-stainless-"+prop)
+func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
+	corsConfig := cors.DefaultConfig()
+	corsConfig.AllowWildcard = true
+	corsConfig.AllowBrowserExtensions = true
+	corsConfig.AllowHeaders = []string{
+		"Authorization",
+		"Content-Type",
+		"User-Agent",
+		"Accept",
+		"X-Requested-With",
+
+		// OpenAI compatibility headers
+		"x-stainless-lang",
+		"x-stainless-package-version",
+		"x-stainless-os",
+		"x-stainless-arch",
+		"x-stainless-retry-count",
+		"x-stainless-runtime",
+		"x-stainless-runtime-version",
+		"x-stainless-async",
+		"x-stainless-helper-method",
+		"x-stainless-poll-helper",
+		"x-stainless-custom-poll-interval",
+		"x-stainless-timeout",
 	}
-	config.AllowOrigins = envconfig.Origins()
+	corsConfig.AllowOrigins = envconfig.AllowedOrigins()
 
 	r := gin.Default()
 	r.Use(
-		cors.New(config),
+		cors.New(corsConfig),
 		allowedHostsMiddleware(s.addr),
 	)
 
+	// General
+	r.HEAD("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
+	r.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "Ollama is running") })
+	r.HEAD("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
+	r.GET("/api/version", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"version": version.Version}) })
+
+	// Local model cache management (new implementation is at end of function)
 	r.POST("/api/pull", s.PullHandler)
+	r.POST("/api/push", s.PushHandler)
+	r.HEAD("/api/tags", s.ListHandler)
+	r.GET("/api/tags", s.ListHandler)
+	r.POST("/api/show", s.ShowHandler)
+	r.DELETE("/api/delete", s.DeleteHandler)
+
+	// Create
+	r.POST("/api/create", s.CreateHandler)
+	r.POST("/api/blobs/:digest", s.CreateBlobHandler)
+	r.HEAD("/api/blobs/:digest", s.HeadBlobHandler)
+	r.POST("/api/copy", s.CopyHandler)
+
+	// Inference
+	r.GET("/api/ps", s.PsHandler)
 	r.POST("/api/generate", s.GenerateHandler)
 	r.POST("/api/chat", s.ChatHandler)
 	r.POST("/api/embed", s.EmbedHandler)
 	r.POST("/api/embeddings", s.EmbeddingsHandler)
-	r.POST("/api/create", s.CreateHandler)
-	r.POST("/api/push", s.PushHandler)
-	r.POST("/api/copy", s.CopyHandler)
-	r.DELETE("/api/delete", s.DeleteHandler)
-	r.POST("/api/show", s.ShowHandler)
-	r.POST("/api/blobs/:digest", s.CreateBlobHandler)
-	r.HEAD("/api/blobs/:digest", s.HeadBlobHandler)
-	r.GET("/api/ps", s.PsHandler)
 
-	// Compatibility endpoints
+	// Inference (OpenAI compatibility)
 	r.POST("/v1/chat/completions", openai.ChatMiddleware(), s.ChatHandler)
 	r.POST("/v1/completions", openai.CompletionsMiddleware(), s.GenerateHandler)
 	r.POST("/v1/embeddings", openai.EmbeddingsMiddleware(), s.EmbedHandler)
 	r.GET("/v1/models", openai.ListMiddleware(), s.ListHandler)
 	r.GET("/v1/models/:model", openai.RetrieveMiddleware(), s.ShowHandler)
 
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		r.Handle(method, "/", func(c *gin.Context) {
-			c.String(http.StatusOK, "Ollama is running")
-		})
+	if rc != nil {
+		// wrap old with new
+		rs := &registry.Local{
+			Client:   rc,
+			Logger:   slog.Default(), // TODO(bmizerany): Take a logger, do not use slog.Default()
+			Fallback: r,
 
-		r.Handle(method, "/api/tags", s.ListHandler)
-		r.Handle(method, "/api/version", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"version": version.Version})
-		})
+			Prune: PruneLayers,
+		}
+		return rs, nil
 	}
 
-	return r
+	return r, nil
 }
 
 func Serve(ln net.Listener) error {
@@ -1300,12 +1271,28 @@ func Serve(ln net.Listener) error {
 		}
 	}
 
+	s := &Server{addr: ln.Addr()}
+
+	var rc *ollama.Registry
+	if useClient2 {
+		var err error
+		rc, err = ollama.DefaultRegistry()
+		if err != nil {
+			return err
+		}
+	}
+
+	h, err := s.GenerateRoutes(rc)
+	if err != nil {
+		return err
+	}
+
+	http.Handle("/", h)
+
 	ctx, done := context.WithCancel(context.Background())
 	schedCtx, schedDone := context.WithCancel(ctx)
 	sched := InitScheduler(schedCtx)
-	s := &Server{addr: ln.Addr(), sched: sched}
-
-	http.Handle("/", s.GenerateRoutes())
+	s.sched = sched
 
 	slog.Info(fmt.Sprintf("Listening on %s (version %s)", ln.Addr(), version.Version))
 	srvr := &http.Server{
@@ -1330,14 +1317,6 @@ func Serve(ln net.Listener) error {
 		sched.unloadAllRunners()
 		done()
 	}()
-
-	// Locate and log what runners are present at startup
-	var runnerNames []string
-	for v := range runners.GetAvailableServers() {
-		runnerNames = append(runnerNames, v)
-	}
-	slog.Info("Dynamic LLM libraries", "runners", runnerNames)
-	slog.Debug("Override detection logic by setting OLLAMA_LLM_LIBRARY")
 
 	s.sched.Run(schedCtx)
 
@@ -1470,7 +1449,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			switch {
 			case os.IsNotExist(err):
 				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("model '%s' not found", req.Model)})
-			case err.Error() == "invalid model name":
+			case err.Error() == errtypes.InvalidModelNameErrMsg:
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			default:
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
