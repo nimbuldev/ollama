@@ -83,6 +83,27 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 			req.Adapters = digestMap
 		case "template":
 			req.Template = c.Args
+		case "draft":
+			path, err := expandPath(c.Args, relativeDir)
+			if err != nil {
+				return nil, err
+			}
+
+			digestMap, err := fileDigestMap(path)
+			if errors.Is(err, os.ErrNotExist) {
+				req.From = c.Args
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+
+			if req.Files == nil {
+				req.Files = digestMap
+			} else {
+				for k, v := range digestMap {
+					req.Files[k] = v
+				}
+			}
 		case "system":
 			req.System = c.Args
 		case "license":

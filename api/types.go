@@ -305,6 +305,7 @@ type CreateRequest struct {
 	Model    string `json:"model"`
 	Stream   *bool  `json:"stream,omitempty"`
 	Quantize string `json:"quantize,omitempty"`
+	Draft 	 string `json:"draft,omitempty"`
 
 	From       string            `json:"from,omitempty"`
 	Files      map[string]string `json:"files,omitempty"`
@@ -357,6 +358,7 @@ type ShowResponse struct {
 	ProjectorInfo map[string]any `json:"projector_info,omitempty"`
 	Tensors       []Tensor       `json:"tensors,omitempty"`
 	ModifiedAt    time.Time      `json:"modified_at,omitempty"`
+	Draft  		  string 		 `json:"draft"`
 }
 
 // CopyRequest is the request passed to [Client.Copy].
@@ -422,6 +424,7 @@ type ListModelResponse struct {
 type ProcessModelResponse struct {
 	Name      string       `json:"name"`
 	Model     string       `json:"model"`
+	Draft     string       `json:"draft"`
 	Size      int64        `json:"size"`
 	Digest    string       `json:"digest"`
 	Details   ModelDetails `json:"details,omitempty"`
