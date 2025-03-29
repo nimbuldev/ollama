@@ -11,11 +11,13 @@ import (
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/discover"
+	"github.com/ollama/ollama/fs/ggml"
 )
 
 func TestEstimateGPULayers(t *testing.T) {
 	t.Setenv("OLLAMA_DEBUG", "1")
 	t.Setenv("OLLAMA_KV_CACHE_TYPE", "") // Ensure default f16
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "2048")
 
 	modelName := "dummy"
 	f, err := os.CreateTemp(t.TempDir(), modelName)
@@ -23,7 +25,7 @@ func TestEstimateGPULayers(t *testing.T) {
 	defer f.Close()
 	inputLayerCount := 5
 
-	tensors := []Tensor{
+	tensors := []ggml.Tensor{
 		{Name: "blk.0.attn.weight", Kind: uint32(0), Offset: uint64(0), Shape: []uint64{1, 1, 1, 1}, WriterTo: bytes.NewReader(make([]byte, 32))},
 		{Name: "blk.1.attn.weight", Kind: uint32(0), Offset: uint64(0), Shape: []uint64{1, 1, 1, 1}, WriterTo: bytes.NewReader(make([]byte, 32))},
 		{Name: "blk.2.attn.weight", Kind: uint32(0), Offset: uint64(0), Shape: []uint64{1, 1, 1, 1}, WriterTo: bytes.NewReader(make([]byte, 32))},
@@ -32,7 +34,7 @@ func TestEstimateGPULayers(t *testing.T) {
 		{Name: "output.weight", Kind: uint32(0), Offset: uint64(0), Shape: []uint64{1, 1, 1, 1}, WriterTo: bytes.NewReader(make([]byte, 32))},
 	}
 	assert.Len(t, tensors, inputLayerCount+1)
-	err = WriteGGUF(f, KV{
+	err = ggml.WriteGGUF(f, ggml.KV{
 		"general.architecture":          "llama",
 		"llama.context_length":          uint32(32),
 		"llama.embedding_length":        uint32(4096),
@@ -60,7 +62,7 @@ func TestEstimateGPULayers(t *testing.T) {
 	opts := api.DefaultOptions()
 	opts.DraftNumCtx = opts.NumCtx
 	t.Run("cpu", func(t *testing.T) {
-		estimate, draftEstimate := EstimateGPULayers(gpus, ggml, projectors, ggml, opts)
+		estimate, draftEstimate := EstimateGPULayers(gpus, ggml, projectors, ggml, opts, 1)
 		assert.Equal(t, 0, estimate.Layers)
 		assert.Equal(t, uint64(0), estimate.Graph)
 		assert.Equal(t, 0, draftEstimate.Layers)
@@ -135,7 +137,7 @@ func TestEstimateGPULayers(t *testing.T) {
 				gpus[1].FreeMemory += layerSize // buffer for draft model layer
 				gpus[1].FreeMemory += min(draftGraphFullOffload, draftGraphPartialOffload)
 			}
-			estimate, draftEstimate := EstimateGPULayers(gpus, ggml, projectors, ggml, opts)
+			estimate, draftEstimate := EstimateGPULayers(gpus, ggml, projectors, ggml, opts, 1)
 			assert.Equal(t, int(s.expect0+s.expect1), estimate.Layers, "scenario %d: %v", i, s)
 			assert.Equal(t, fmt.Sprintf("%d,%d", s.expect0, s.expect1), estimate.TensorSplit, "scenario %d: %v", i, s)
 			if s.useDraft {
